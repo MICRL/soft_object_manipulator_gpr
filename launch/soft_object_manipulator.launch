@@ -1,0 +1,10 @@
+<launch>
+
+    <!-- open realsense camera -->
+    <include file="$(find realsense_ros)/launch/realsense_ros.launch">
+    <arg name="sNum1"                   value="611205001943" />
+    </include>
+
+    <node pkg="soft_object_manipulator_gpr" name="soft_object_manipulator_gpr_node" type="soft_object_manipulator_gpr_node" output="screen" />
+</launch>
+

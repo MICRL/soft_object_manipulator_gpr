@@ -1,0 +1,1141 @@
+//system and self
+#include <Eigen/Geometry>
+#include <iostream>
+#include <fstream>
+#include <cmath>
+#include <math.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+#include <omp.h>
+#include <algorithm>
+#include <limits.h>
+#include <boost/format.hpp>
+#include "rt_nonfinite.h"
+#include "onlineGPR.h"
+#include "rt_nonfinite.h"
+#include "rtwtypes.h"
+#include "onlineGPR_types.h"
+#include "onlineGPR_terminate.h"
+#include "onlineGPR_initialize.h"
+
+//vision process library
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/features/normal_3d_omp.h>
+#include <pcl/features/principal_curvatures.h>
+#include <pcl/segmentation/supervoxel_clustering.h>
+#include <pcl/segmentation/region_growing.h>
+#include <pcl/search/search.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/point_types_conversion.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/common.h>
+#include <pcl/visualization/cloud_viewer.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+
+//ros
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <std_msgs/Float32.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Int8.h>
+#include <sensor_msgs/JointState.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <cv_bridge/cv_bridge.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/chain.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <pcl_ros/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+//stateRecorder
+#include "StateRecorder.h"
+
+#define USETIME 1
+#define Malloc(type,n) (type *)malloc((n)*sizeof(type))
+
+#if (USETIME)
+  #include <time.h>
+  struct timeval starttime, endtime;
+  long mtime, seconds, useconds;
+#endif
+
+double RADIUS; //0.015f
+int K; //10
+int TOP; // 10
+double DOWN_SAMPLE_SIZE_1; // 0.005f
+double DOWN_SAMPLE_SIZE_2; // 0.01f
+
+static int DILATE_KERNEL_SIZE;
+static int DILATE_ITERATIONS;
+static int ERODE_KERNEL_SIZE;
+static int ERODE_ITERATIONS;
+static double CENTER_THRESHOLD;
+static double RADIUS_THRESHOLD;
+static double X_LENG_THRESHOLD;
+static double Y_LENG_THRESHOLD;
+static double C_SIMI_THRESHOLD;
+static double C_AREA_THRESHOLD;
+static double RESEIVE_THRESHOLD;
+static double RESEIVE_LOWERBOUND;
+static double DISTANCE_3D_THRESHOLD;
+static double Z_3D_THRESHOLD;
+static double Z_MAX_EXTAND;
+
+static double TARGET_1;
+static double TARGET_2;
+static double TARGET_3;
+static double TARGET_4;
+static double TARGET_5;
+static double TARGET_6;
+
+const int N = 4; //4
+const int M = 2; //2
+const int F = 2; //1
+const int F3 = 6; // 3F
+int FPS; //5
+double MAX_VEL; // 0.04, max allowed velocity
+double TOLERANCE; //0.005
+
+int counter = 0;
+
+static const std::string OPENCV_WINDOW = "processed window";
+static const std::string OPENCV_WINDOW_2 = "original window";
+static const std::string OPENCV_WINDOW_3 = "2D Image";
+
+ros::Publisher filtered_pub;
+ros::Publisher final_pub;
+ros::Publisher diff_pub;;
+
+pcl::PointCloud <pcl::PointXYZRGB>::Ptr cloud (new pcl::PointCloud <pcl::PointXYZRGB>);
+pcl::PointCloud <pcl::PointXYZRGB>::Ptr cloud_filtered (new pcl::PointCloud <pcl::PointXYZRGB>);
+pcl::PointCloud <pcl::PointXYZRGB>::Ptr cloud_final (new pcl::PointCloud <pcl::PointXYZRGB>);
+pcl::PointCloud <pcl::PointXYZRGB>::Ptr cloud_temp (new pcl::PointCloud <pcl::PointXYZRGB>);
+pcl::PointCloud <pcl::PointXYZRGB>::Ptr cloud_downsampled (new pcl::PointCloud <pcl::PointXYZRGB>);
+pcl::PointIndices::Ptr inliers (new pcl::PointIndices ());
+pcl::ExtractIndices<pcl::PointXYZRGB> eifilter (true); // Initializing with true will allow us to extract the removed indices
+pcl::visualization::CloudViewer viewer ("cloud_final");
+
+pcl::KdTreeFLANN<pcl::PointXYZRGB> kdtree;
+
+//real cartesian velocity of ee reciving from yumi topic
+double cart_v_real[3*M] = {0};
+//global variable feedback points
+double p[F3] = {0};
+
+std::vector<int> index_map;
+
+sensor_msgs::Image image_; // cache the image message
+
+std::vector<std::vector<cv::Point> > contours;
+std::vector<cv::Vec4i> hierarchy;
+std::vector<std::vector<cv::Point> > original_contours;
+std::vector<cv::Vec4i> original_hierarchy;
+
+cv_bridge::CvImagePtr cv_ptr;
+cv::Mat original_mat;
+cv::Mat dst;
+cv::Mat bgr[3];
+
+bool confirmed = false; bool computed_center_3d[F] = {false};
+cv::Point center_2d[F];
+double radius_2d[F], x_leng_2d[F], y_leng_2d[F], c_simi_2d[F], c_area_2d[F];
+pcl::PointXYZRGB center_3d[F];
+
+pcl::PointXYZRGB minPt, maxPt;
+
+bool received = false,getFeedbackPoint = false,getFeedbackPointcached = false,moved = false;
+
+const float bad_point = std::numeric_limits<float>::quiet_NaN();
+
+static void getFeatures(const double* p, double* c_p)
+{
+  for (int i = 0; i < 3*F; i++)
+  {
+    c_p[i] = p[i];
+  }
+  // c_p[3] = p[3];
+}
+
+//return the distance between two points
+
+double getDistance(pcl::PointXYZRGB p1, pcl::PointXYZRGB p2)
+{
+  return std::sqrt((p1.x-p2.x)*(p1.x-p2.x) + (p1.y-p2.y)*(p1.y-p2.y) + (p1.z-p2.z)*(p1.z-p2.z));
+}
+
+double getDistance_2d(pcl::PointXYZRGB p1, pcl::PointXYZRGB p2)
+{
+  return std::sqrt((p1.x-p2.x)*(p1.x-p2.x) + (p1.y-p2.y)*(p1.y-p2.y));
+}
+
+
+double getDistance(cv::Point p1, cv::Point p2)
+{
+  return cv::norm(p1 - p2);
+}
+
+//return value higher than threshold
+void highPass(double *pointer,int size, double threshold)
+{
+  for(int i=0;i<size;i++)
+  {
+    if(std::abs(pointer[i])<threshold)
+      pointer[i] = 0;
+  }
+}
+
+//return soomth value
+void lowPass(double *p, pcl::PointXYZRGB* center)
+{
+  double lambda = 0.2;
+  for (int f = 0; f < F; f++)
+  {
+    p[f*3+0] = lambda*p[f*3+0] + (1-lambda)*center[f].x;
+    p[f*3+1] = lambda*p[f*3+1] + (1-lambda)*center[f].y;
+    p[f*3+2] = lambda*p[f*3+2] + (1-lambda)*center[f].z;
+  }
+}
+
+//return the centroid of given points
+pcl::PointXYZRGB getCentroid(pcl::PointCloud <pcl::PointXYZRGB> p)
+{
+  pcl::PointXYZRGB centroid;
+  for(int i=0;i<p.size();i++)
+  {
+    centroid.x += p[i].x;
+    centroid.y += p[i].y;
+    centroid.z += p[i].z;
+  }
+  centroid.x /= p.size();
+  centroid.y /= p.size();
+  centroid.z /= p.size();
+  return centroid;
+}
+
+pcl::PointXYZRGB getCentroid(pcl::PointIndices::Ptr& inliers, std::vector<cv::Point> contour, int f)
+{
+  std::vector<int>::iterator it;
+  pcl::PointXYZRGB centroid;
+  int confirmed_num = 0;
+  double distance;
+  double z_gap;
+  for (int i = 0; i < contour.size(); i++)
+  {
+    int idx = contour[i].y * cloud_filtered->width + contour[i].x;
+    it = std::find(index_map.begin(), index_map.end(), idx);
+    if (it != index_map.end())
+    {
+      if (confirmed_num == 0)
+      {
+        if (computed_center_3d[f])
+        {
+          distance = getDistance_2d((*cloud_filtered)[idx], center_3d[f]);
+          z_gap = std::abs((*cloud_filtered)[idx].z - center_3d[f].z);
+        }
+        else
+        {
+          distance = 0;
+          z_gap = 0;
+        }
+      }
+      else
+      {
+        distance = getDistance_2d((*cloud_filtered)[idx], centroid);
+        z_gap = std::abs((*cloud_filtered)[idx].z - centroid.z);
+      }
+      if (distance < DISTANCE_3D_THRESHOLD && z_gap < Z_3D_THRESHOLD)
+      {
+        confirmed_num += 1;
+        if (confirmed_num == 1)
+        {
+          centroid = (*cloud_filtered)[idx];
+        }
+        else
+        {
+          centroid.x = centroid.x * (confirmed_num - 1) / confirmed_num + (*cloud_filtered)[idx].x / confirmed_num;
+          centroid.y = centroid.y * (confirmed_num - 1) / confirmed_num + (*cloud_filtered)[idx].y / confirmed_num;
+          centroid.z = centroid.z * (confirmed_num - 1) / confirmed_num + (*cloud_filtered)[idx].z / confirmed_num;
+        }
+        inliers->indices.push_back(std::distance(index_map.begin(), it));
+      }
+    }
+    else
+    {
+      std::cout << "Warning! Exsit Point which cannot map back to PointCloud!" << std::endl;
+    }
+  }
+
+  if (inliers->indices.size() != 0)
+  {
+    computed_center_3d[f] = true;
+    return centroid;
+  }
+  computed_center_3d[f] = false;
+  std::cout << "3D Threshold too small! All points are filtered out!" << std::endl;
+  return centroid;
+}
+
+cv::Point getCentroid_2d(std::vector <cv::Point> p)
+{
+  if (p.size() == 0)
+  {
+    return cv::Point(0,0);
+    std::cout << "Empty contour!" << std::endl;
+  }
+  cv::Point centroid = cv::Point(0,0);
+  for (int i = 0; i < p.size(); i++)
+  {
+    centroid.x += p[i].x;
+    centroid.y += p[i].y;
+  }
+  centroid.x /= double(p.size());
+  centroid.y /= double(p.size());
+  return centroid;
+}
+
+double getRadius(std::vector <cv::Point> p, cv::Point center)
+{
+  if (p.size() == 0)
+  {
+    return 0;
+  }
+  double radius_sum = 0;
+  for (int i = 0; i < p.size(); i++)
+  {
+      radius_sum += cv::norm(p[i]-center);
+  }
+  return radius_sum/p.size();
+}
+
+double getXLeng(std::vector <cv::Point>p)
+{
+  if (p.size() == 0)
+  {
+    return 0;
+  }
+  double x_min = p[0].x;
+  double x_max = p[0].x;
+  for (int i = 1; i < p.size(); i++)
+  {
+    if (p[i].x < x_min)
+    {
+      x_min = p[i].x;
+    }
+
+    if (p[i].x > x_max)
+    {
+      x_max = p[i].x;
+    }
+  }
+  return x_max - x_min;
+}
+
+double getYLeng(std::vector <cv::Point>p)
+{
+  if (p.size() == 0)
+  {
+    return 0;
+  }
+  double y_min = p[0].y;
+  double y_max = p[0].y;
+  for (int i = 1; i < p.size(); i++)
+  {
+    if (p[i].y < y_min)
+    {
+      y_min = p[i].y;
+    }
+
+    if (p[i].y > y_max)
+    {
+      y_max = p[i].y;
+    }
+  }
+  return y_max - y_min;
+}
+
+double getCSimi(std::vector <cv::Point> p, cv::Point center, double radius)
+{
+  if (p.size() == 0)
+  {
+    return 0;
+  }
+  double diff_sum = 0;
+  for (int i = 1; i < p.size(); i++)
+  {
+    diff_sum += std::abs(cv::norm(p[i]-center) / radius - 1);
+  }
+  return diff_sum / p.size();
+}
+
+template<class T> double getTriangleArea(T p1, T p2, T p3)
+{
+  double a = getDistance(p1, p2);
+  double b = getDistance(p2, p3);
+  double c = getDistance(p3, p1);
+  double s = (a+b+c)/2;
+  double area = std::sqrt(s * (s-a) * (s-b) * (s-c));
+  if (std::isnan(area))
+  {
+    area = 0;
+  }
+  return area;
+}
+
+template<class T1, class T2> double getArea(T1 p, T2 center)
+{
+  if (p.size() < 3)
+  {
+    return 0;
+  }
+  double areaSum = 0;
+  for (int i=0; i<p.size()-1; i++)
+  {
+    areaSum += getTriangleArea(p[i], p[i+1], center);
+  }
+  areaSum += getTriangleArea(p[0], p[p.size()-1], center);
+  return areaSum;
+}
+
+//callback to get joint state
+void cartVelCallback(const std_msgs::Float64MultiArray& msg)
+{
+  for (int i = 0; i < msg.data.size(); i++)
+  {
+    cart_v_real[i] = msg.data[i];
+  }
+  //high pass to filter noise
+  highPass(cart_v_real,msg.data.size(),1e-4);
+
+  for(int i=0;i<6;i++)
+    if(cart_v_real[i] != 0)
+      moved = true;
+  received = true;
+
+  // std::cout << "received real cartesian velocity from yumi topic\n";
+}
+
+bool start = false;
+void startCallback(const std_msgs::Bool& msg)
+{
+  start = msg.data;
+}
+
+
+//time to start tracking stage
+void pointCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
+{
+  // Read the cloud from the ROS msg
+  pcl::fromROSMsg(*cloud_msg, *cloud);
+
+  // Cut the depth of the cloud
+  pcl::PassThrough<pcl::PointXYZRGB> pass;
+  pass.setInputCloud (cloud);
+  pass.setKeepOrganized(true);
+  pass.setFilterFieldName ("z");
+  pass.setFilterLimits (0.0, confirmed ? maxPt.z + Z_MAX_EXTAND : 2.0);
+  pass.filter (*cloud_filtered);
+
+  // Extract the points with the aprropriate color
+  pcl::PointXYZHSV temp;
+  for(int i=0;i<cloud_filtered->size();i++)
+  {
+    pcl::PointXYZRGBtoXYZHSV(cloud_filtered->points[i],temp);
+    if(temp.h>160 && temp.h<210 && temp.s>0.6 && temp.v>0.25)
+    {
+      inliers->indices.push_back(i);
+      cloud_filtered->points[i].g = 255;
+    }
+  }
+  eifilter.setInputCloud (cloud_filtered);
+  eifilter.setIndices (inliers);
+  eifilter.setKeepOrganized(true);
+  eifilter.filterDirectly (cloud_filtered);
+  // eifilter.filter(*cloud_temp);
+
+  inliers->indices.clear();
+
+  pcl::getMinMax3D (*cloud_filtered, minPt, maxPt);
+
+  // Perform the down-sampling
+  pcl::VoxelGrid<pcl::PointXYZRGB> ds;
+  ds.setInputCloud (cloud_filtered);
+  ds.setLeafSize (DOWN_SAMPLE_SIZE_1, DOWN_SAMPLE_SIZE_1, DOWN_SAMPLE_SIZE_1);
+  ds.filter (*cloud_downsampled);
+  // std::cout << cloud_downsampled->size() << std::endl;
+  //
+  pcl::removeNaNFromPointCloud(*cloud_downsampled, *cloud_temp, index_map);
+  index_map.clear();
+  //
+
+  // Statistical Outlier Removal
+  pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor;
+  sor.setInputCloud (cloud_downsampled);
+  sor.setMeanK (20);
+  sor.setStddevMulThresh (0.6);
+  sor.filter (*cloud_temp);
+  // sor.filter(inliers->indices);
+
+  kdtree.setInputCloud (cloud_temp);
+
+  #pragma omp parallel for
+  for (int i = 0; i < cloud_filtered->size(); i++)
+  {
+    std::vector<int> pointIdxRadiusSearch;
+    std::vector<float> pointRadiusSquaredDistance;
+    if (pcl::isFinite((*cloud_filtered)[i]))
+    {
+      if ( kdtree.radiusSearch ((*cloud_filtered)[i], RADIUS, pointIdxRadiusSearch, pointRadiusSquaredDistance) == 0 )
+      {
+        (*cloud_filtered)[i].x = (*cloud_filtered)[i].y = (*cloud_filtered)[i].z = bad_point;
+      }
+    }
+  }
+
+  pcl::removeNaNFromPointCloud(*cloud_filtered, *cloud_final, index_map);
+
+  try
+  {
+    pcl::toROSMsg (*cloud_filtered, image_); //convert the cloud
+  }
+  catch (std::runtime_error e)
+  {
+    ROS_ERROR_STREAM("Error in converting cloud to image message: "<< e.what());
+    return;
+  }
+
+  try
+  {
+    cv_ptr = cv_bridge::toCvCopy(image_);
+  }
+  catch (cv_bridge::Exception& e)
+  {
+    ROS_ERROR("cv_bridge exception: %s", e.what());
+    return;
+  }
+
+  cv::split(cv_ptr->image,bgr);
+  cv::threshold(bgr[0], original_mat, 10, 255, 0);
+
+  // dilate and erode
+  cv::Mat dilate_element = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(DILATE_KERNEL_SIZE,DILATE_KERNEL_SIZE));
+  cv::Mat erode_element = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ERODE_KERNEL_SIZE,ERODE_KERNEL_SIZE));
+  cv::dilate(original_mat, dst, dilate_element, cv::Point(-1,-1), DILATE_ITERATIONS);
+  cv::erode(dst, dst, dilate_element, cv::Point(-1,-1), ERODE_ITERATIONS);
+
+  cv::imshow(OPENCV_WINDOW_3, dst);
+  cv::waitKey(3);
+
+  cv::findContours(dst,contours,hierarchy,cv::RETR_CCOMP,cv::CHAIN_APPROX_SIMPLE);
+  cv::Mat imageContours = cv::Mat::zeros(dst.size(),CV_8UC1);
+
+  int target_idx[F], original_target_idx[F];
+  std::vector<pcl::PointIndices::Ptr> mapping_idx;
+  for (int i = 0; i < F; i++)
+  {
+    pcl::PointIndices::Ptr temp_idx (new pcl::PointIndices ());
+    mapping_idx.push_back(temp_idx);
+  }
+
+
+  if (confirmed)
+  {
+    for (int f = 0; f < F; f ++)
+    {
+      bool found = false;
+      cv::Point temp_center, best_center;
+      double temp_radius, temp_x_leng, temp_y_leng, temp_c_simi, temp_c_area;
+      double best_radius, best_x_leng, best_y_leng, best_c_simi, best_c_area;
+      double min_distance = 10000;
+
+      for (int i = 0; i < contours.size(); i++)
+      {
+        temp_center = getCentroid_2d(contours[i]);
+        temp_radius = getRadius(contours[i], temp_center);
+        temp_x_leng = getXLeng(contours[i]);
+        temp_y_leng = getYLeng(contours[i]);
+        temp_c_simi = getCSimi(contours[i], temp_center, temp_radius);
+        temp_c_area = getArea(contours[i], temp_center);
+        if (
+          cv::norm(temp_center - center_2d[f]) < CENTER_THRESHOLD &&
+          std::abs(temp_radius - radius_2d[f]) < RADIUS_THRESHOLD &&
+          std::abs(temp_x_leng - x_leng_2d[f]) < X_LENG_THRESHOLD &&
+          std::abs(temp_y_leng - y_leng_2d[f]) < Y_LENG_THRESHOLD &&
+          std::abs(temp_c_simi - c_simi_2d[f]) < C_SIMI_THRESHOLD &&
+          std::abs(temp_c_area - c_area_2d[f]) < C_AREA_THRESHOLD
+        )
+        {
+          if (min_distance > cv::norm(temp_center - center_2d[f]))
+          {
+            min_distance = cv::norm(temp_center - center_2d[f]);
+
+            found = true;
+            target_idx[f] = i;
+            best_center = temp_center;
+            best_radius = temp_radius;
+            best_x_leng = temp_x_leng;
+            best_y_leng = temp_y_leng;
+            best_c_simi = temp_c_simi;
+            best_c_area = temp_c_area;
+          }
+        }
+      }
+
+      if (found)
+      {
+        center_2d[f] = best_center;
+        radius_2d[f] = best_radius;
+        x_leng_2d[f] = best_x_leng;
+        y_leng_2d[f] = best_y_leng;
+        c_simi_2d[f] = best_c_simi;
+        c_area_2d[f] = best_c_area;
+        cv::drawContours(imageContours,contours,target_idx[f],cv::Scalar(255),1,8,hierarchy);
+      }
+      else
+      {
+        confirmed = false;
+        std::cout << "Nooooooooooo Candidates! for " << f << std::endl;
+        for (int i = 0; i < contours.size(); i++)
+        {
+          cv::drawContours(imageContours,contours,i,cv::Scalar(255),1,8,hierarchy);
+          temp_center = getCentroid_2d(contours[i]);
+          temp_radius = getRadius(contours[i], temp_center);
+          temp_x_leng = getXLeng(contours[i]);
+          temp_y_leng = getYLeng(contours[i]);
+          temp_c_simi = getCSimi(contours[i], temp_center, temp_radius);
+          temp_c_area = getArea(contours[i], temp_center);
+          std::cout << std::setw(6) << cv::norm(temp_center - center_2d[f]) << "\t"
+                    << std::setw(6) << std::abs(temp_radius - radius_2d[f]) << "\t"
+                    << std::setw(6) << std::abs(temp_x_leng - x_leng_2d[f]) << "\t"
+                    << std::setw(6) << std::abs(temp_y_leng - y_leng_2d[f]) << "\t"
+                    << std::setw(6) << std::abs(temp_c_simi - c_simi_2d[f]) << "\t"
+                    << std::setw(6) << std::abs(temp_c_area - c_area_2d[f]) << std::endl;
+        }
+        cv::imshow(OPENCV_WINDOW, imageContours);
+        cv::waitKey(3);
+        int dummy;
+        std::cin >> dummy;
+        computed_center_3d[f] = false;
+        break;
+      }
+    }
+  }
+
+  if (!confirmed)
+  {
+    if (contours.size() != F+1)
+    {
+      std::cout << "Please replace the cloth!" << std::endl;
+      for (int i = 0; i < contours.size(); i++)
+      {
+        cv::drawContours(imageContours,contours,i,cv::Scalar(255),1,8,hierarchy);
+      }
+      getFeedbackPointcached = false;
+      getFeedbackPoint = false;
+      return;
+    }
+    else
+    {
+      cv::Point temp_center[F+1];
+      double temp_radius[F+1];
+      double max_temp_radius = 0;
+      int discard_idx;
+      int idx_ordered[F];
+      for (int i = 0; i < F+1; i++)
+      {
+        temp_center[i] = getCentroid_2d(contours[i]);
+        temp_radius[i] = getRadius(contours[i], temp_center[i]);
+        if (temp_radius[i] > max_temp_radius)
+        {
+          max_temp_radius = temp_radius[i];
+          discard_idx = i;
+        }
+      }
+
+      if (discard_idx != F)
+      {
+        temp_center[discard_idx] = temp_center[F];
+        temp_radius[discard_idx] = temp_radius[F];
+        contours[discard_idx] = contours[F];
+      }
+
+      // Want to order the holes
+      for (int i = 0; i < F; i++)
+      {
+          int j = 0;
+          while (j < i && temp_center[i].x > temp_center[idx_ordered[j]].x)
+          {
+            j++;
+          }
+          for (int k = i; k > j; k--)
+          {
+            idx_ordered[k] = idx_ordered[k-1];
+          }
+          idx_ordered[j] = i;
+      }
+
+      for (int f = 0; f < F; f++)
+      {
+        std::cout << temp_center[idx_ordered[f]].x << " ";
+        center_2d[f] = temp_center[idx_ordered[f]];
+        radius_2d[f] = temp_radius[idx_ordered[f]];
+        x_leng_2d[f] = getXLeng(contours[idx_ordered[f]]);
+        y_leng_2d[f] = getYLeng(contours[idx_ordered[f]]);
+        c_simi_2d[f] = getCSimi(contours[idx_ordered[f]], center_2d[f], radius_2d[f]);
+        c_area_2d[f] = getArea(contours[idx_ordered[f]], center_2d[f]);
+        cv::drawContours(imageContours,contours,idx_ordered[f],cv::Scalar(255),1,8,hierarchy);
+        std::cout << std::setw(6) << radius_2d[f] << "\t"
+                  << std::setw(6) << x_leng_2d[f] << "\t"
+                  << std::setw(6) << y_leng_2d[f] << "\t"
+                  << std::setw(6) << c_simi_2d[f] << "\t"
+                  << std::setw(6) << c_area_2d[f] << std::endl;
+      }
+      std::cout << std::endl;
+      confirmed = true;
+    }
+  }
+
+  cv::imshow(OPENCV_WINDOW, imageContours);
+  cv::waitKey(3);
+
+  cv::findContours(original_mat,original_contours,original_hierarchy,cv::RETR_CCOMP,cv::CHAIN_APPROX_SIMPLE);
+  cv::Mat original_imageContours = cv::Mat::zeros(original_mat.size(),CV_8UC1);
+
+  for (int f = 0; f < F; f++)
+  {
+    double min_target_radius = 100000, temp_target_radius;
+    bool found_original = false;
+    for (int i = 0; i < original_contours.size(); i++)
+    {
+      cv::Point temp_center = getCentroid_2d(original_contours[i]);
+      double temp_radius = getRadius(original_contours[i], temp_center);
+      if (std::abs(temp_radius - radius_2d[f]) < RESEIVE_THRESHOLD && temp_radius > RESEIVE_LOWERBOUND)
+      {
+        temp_target_radius = getRadius(original_contours[i], center_2d[f]);
+        if (temp_target_radius < min_target_radius)
+        {
+          min_target_radius = temp_target_radius;
+          found_original = true;
+          original_target_idx[f] = i;
+        }
+      }
+    }
+    if (!found_original)
+    {
+      std::cout << "Cannot find the corresponding contour in the original image!" << std::endl;
+      computed_center_3d[f] = false;
+      getFeedbackPointcached = false;
+      getFeedbackPoint = false;
+      return;
+    }
+    cv::drawContours(original_imageContours,original_contours,original_target_idx[f],cv::Scalar(255),1,8,original_hierarchy);
+  }
+
+
+  cv::imshow(OPENCV_WINDOW_2, original_imageContours);
+  cv::waitKey(3);
+
+
+  // Map back to the Point cloud_final
+  for (int f = 0; f < F; f++)
+  {
+    center_3d[f] = getCentroid(mapping_idx[f], original_contours[original_target_idx[f]], f);
+    if (!computed_center_3d[f])
+    {
+      getFeedbackPointcached = false;
+      getFeedbackPoint = false;
+      return;
+    }
+  }
+
+  for (int f = 0; f < F; f++)
+  {
+    for (int i = 0; i < mapping_idx[f]->indices.size(); i++)
+    {
+      (*cloud_final)[mapping_idx[f]->indices[i]].r = 255;
+      (*cloud_final)[mapping_idx[f]->indices[i]].g = 0;
+    }
+    center_3d[f].r = 255;
+    center_3d[f].g = 0;
+    center_3d[f].b = 255;
+    cloud_final->push_back(center_3d[f]);
+  }
+
+  lowPass(p, center_3d);
+
+  if (getFeedbackPointcached)
+  {
+    getFeedbackPoint = true;
+  }
+  else
+  {
+    getFeedbackPointcached = true;
+  }
+
+
+  // Convert to ROS data type
+  sensor_msgs::PointCloud2 filtered_output;
+  sensor_msgs::PointCloud2 final_output;
+  std_msgs::Float32 diff_msgs;
+
+  pcl::toROSMsg(*cloud_filtered, filtered_output);
+  pcl::toROSMsg(*cloud_final, final_output);
+  filtered_output.header = cloud_msg->header;
+  final_output.header = cloud_msg->header;
+  diff_msgs.data = 0;
+
+  // Publish the data
+  filtered_pub.publish (filtered_output);
+  final_pub.publish (final_output);
+  diff_pub.publish (diff_msgs);
+
+  viewer.showCloud(cloud_final);
+}
+
+
+
+void main_soft_object_manipulator(int argc,char ** argv)
+{
+  //onlineGPR input variable
+  double x[F3] = {0};    // value of the input of GPR;
+  double x_v[F3] = {0};  // real input of GPR; the difference between of the last frame and this frame
+  double x_old[F3] = {0};// last frame of the input
+  double y[6] = {0};    // label of GPR
+  double x_star[F3] = {0}; // target position - current position
+  static double gram_matrix_data[10000] = {0};  // inverse of K
+  int gram_matrix_size[2] = {0};
+  double X_data[F3*100] = {0}; // aggregation of x_v
+  int X_size[2] = {0};
+  double Y_data[600] = {0}; // aggregation of y
+  int Y_size[2] = {0};
+  static double K_data[10000] = {0};
+  int K_size[2] = {0};
+  static double gram_matrix_update_data[10201] = {0};
+  int gram_matrix_update_size[2] = {0};
+  double y_star[6] = {0};
+  double cov_star;
+  double X_update_data[F3*101] = {0};
+  int X_update_size[2] = {0};
+  double Y_update_data[606] = {0};
+  int Y_update_size[2] = {0};
+  static double K_update_data[10201] = {0};
+  int K_update_size[2] = {0};
+
+  //others
+  double xd[F3] = {0}; // target location
+  //record state for debug
+  StateRecorder stateRecorder;
+
+  ros::init(argc,argv, "soft_object_manipulator", ros::init_options::NoSigintHandler);
+  ros::NodeHandle node("~");
+  //subscrib topic /yumi/joint_state to get joint state
+  ros::Subscriber subCartVel = node.subscribe("/yumi/ikSloverVel_controller/state", 1000, cartVelCallback);
+  //subscrib the start signal
+  ros::Subscriber subStart = node.subscribe("/yumi/ikSloverVel_controller/go", 1000, startCallback);
+  //publish velocity control command
+  ros::Publisher cartVelPublisher = node.advertise<std_msgs::Float64MultiArray> ("/yumi/ikSloverVel_controller/command", 1);
+  //publish pcd record command: 1 for record and 2 for replay
+  ros::Publisher pcdRecorderPublisher = node.advertise<std_msgs::Int8> ("/pcd_recorder/command", 2);
+
+  ros::Subscriber imagePoint_sub = node.subscribe("/camera/depth_registered/points_SR300_611205001943", 2, pointCallback);
+
+  filtered_pub = node.advertise<sensor_msgs::PointCloud2> ("filtered_output", 1);
+  final_pub = node.advertise<sensor_msgs::PointCloud2> ("final_output", 1);
+  diff_pub = node.advertise<std_msgs::Float32> ("diff", 1);
+
+  //command
+  std_msgs::Float64MultiArray armCommand;
+  armCommand.data.resize(3*M);
+
+  #if (USETIME)
+    gettimeofday(&starttime, NULL);
+  #endif
+
+  node.param("RADIUS", RADIUS, 0.015);
+  node.param("K", K, 10);
+  node.param("TOP", TOP, 10);
+  node.param("DOWN_SAMPLE_SIZE_1", DOWN_SAMPLE_SIZE_1, 0.005);
+  node.param("DOWN_SAMPLE_SIZE_2", DOWN_SAMPLE_SIZE_2, 0.01);
+
+  node.param("FPS", FPS, 5);
+  node.param("MAX_VEL", MAX_VEL, 0.04);
+  node.param("TOLERANCE", TOLERANCE, 0.005);
+
+  node.param("dilate_kernel_size", DILATE_KERNEL_SIZE, 3);
+  node.param("dilate_iterations", DILATE_ITERATIONS, 1);
+  node.param("erode_kernel_size", ERODE_KERNEL_SIZE, 3);
+  node.param("erode_iterations", ERODE_ITERATIONS, 1);
+
+  node.param("center_threshold", CENTER_THRESHOLD, 10.0);
+  node.param("radius_threshold", RADIUS_THRESHOLD, 10.0);
+  node.param("x_leng_threshold", X_LENG_THRESHOLD, 10.0);
+  node.param("y_leng_threshold", Y_LENG_THRESHOLD, 10.0);
+  node.param("c_simi_threshold", C_SIMI_THRESHOLD, 10.0);
+  node.param("c_area_threshold", C_AREA_THRESHOLD, 10.0);
+
+  node.param("reseive_threshold", RESEIVE_THRESHOLD, 10.0);
+  node.param("reseive_lowerbound", RESEIVE_LOWERBOUND, 10.0);
+
+  node.param("distance_3d_threshold", DISTANCE_3D_THRESHOLD, 10.0);
+  node.param("z_3d_threshold", Z_3D_THRESHOLD, 10.0);
+  node.param("z_max_extand", Z_MAX_EXTAND, 0.05);
+
+  node.param("target_1", TARGET_1, 0.0);
+  node.param("target_2", TARGET_2, -0.05);
+  node.param("target_3", TARGET_3, 0.0);
+  node.param("target_4", TARGET_4, 0.0);
+  node.param("target_5", TARGET_5, 0.0);
+  node.param("target_6", TARGET_6, 0.0);
+
+  ros::Rate rate(FPS);
+  bool first_time = true;
+  bool stopFlag = false;
+  int count = 0;
+  while(ros::ok())
+  {
+
+    #if (USETIME)
+      gettimeofday(&endtime, NULL);
+      seconds  = endtime.tv_sec  - starttime.tv_sec;
+      useconds = endtime.tv_usec - starttime.tv_usec;
+      mtime = ((seconds) * 1000 + useconds/1000.0) + 0.5;
+      std::cout << "total:\t" << mtime << std::endl << std::endl;
+      gettimeofday(&starttime, NULL);
+    #endif
+
+    if(viewer.wasStopped()) break;
+    //reached the target
+    if(stopFlag)
+    {
+      if(start)
+      {
+        for(int i=0;i<6;i++)
+            armCommand.data[i] = 0;
+        cartVelPublisher.publish(armCommand);
+      }
+      std::cout << "Reached the target SUCCESSFULLY\n";
+      break;
+    }
+
+    if (received && getFeedbackPointcached)
+    {
+      for(int i=0;i<F3;i++)
+        x_old[i] = x[i];
+      getFeatures(p,x);
+      for(int i=0;i<F3;i++)
+        x_v[i] = (x[i] - x_old[i])*FPS;
+      for(int i=0;i<F3;i++)
+        x_star[i] = xd[i] - x[i];
+      for(int i=0;i<6;i++)
+        y[i] = cart_v_real[i];
+      highPass(y,6,1e-4);
+    }
+
+    if(received && getFeedbackPoint)
+    {
+      if(first_time && confirmed)
+      {
+        double C[F3] = {TARGET_1,TARGET_2,TARGET_3,TARGET_4,TARGET_5,TARGET_6};
+        for(int i=0;i<F3;i++)
+          xd[i] = x[i] + C[i];
+      }
+
+      if(moved)
+      {
+        if(first_time)
+        {
+          /*Initialize*/
+          //X
+          for(int i=0;i<F3;i++)
+            X_data[i] = x_v[i];
+          X_size[0] = F3;
+          X_size[1] = 1;
+          //Y
+          for(int i=0;i<6;i++)
+            Y_data[i] = y[i];
+          Y_size[0] = 1;
+          Y_size[1] = 6;
+          //K
+          K_data[0] = 1;
+          K_size[0] = 1;
+          K_size[1] = 1;
+          //gram_matrix
+          double keps = 1e-4;
+          gram_matrix_data[0] = 1/(1+keps);
+          gram_matrix_size[0] = 1;
+          gram_matrix_size[1] = 1;
+
+          stateRecorder.record(x_v,y,x_star,y_star,X_data,Y_data,K_data,gram_matrix_data);
+          //record the target point yd
+          ofstream target_file;
+          target_file.open(ros::package::getPath("soft_object_manipulator")+"/record_data/yd.txt");
+          for(int i=0;i<F3;i++)
+            target_file<<xd[i]<<' ';
+
+          first_time = false;
+        }
+
+        else
+        {
+          //for debug
+          // std::cout<<"K: ";
+          // for(int i=0;i<9;i++)
+          //   std::cout<<K_data[i]<<" ";
+          // std::cout<<"\n";
+          // std::cout<<"gram_matrix: ";
+          // for(int i=0;i<9;i++)
+          //   std::cout<<gram_matrix_data[i]<<" ";
+          // std::cout<<"\n";
+
+          // Call the entry-point 'onlineGPR'.
+          onlineGPR(x_v, y, x_star, gram_matrix_data, gram_matrix_size, X_data, X_size,
+              Y_data, Y_size, K_data, K_size, gram_matrix_update_data,
+              gram_matrix_update_size, y_star, &cov_star, X_update_data,
+              X_update_size, Y_update_data, Y_update_size, K_update_data,
+              K_update_size);
+          stateRecorder.record(x_v,y,x_star,y_star,X_data,Y_data,K_data,gram_matrix_data);
+
+          //update K and gram_matrix
+          K_size[0] = K_update_size[0];
+          K_size[1] = K_update_size[1];
+          gram_matrix_size[0] = gram_matrix_update_size[0];
+          gram_matrix_size[1] = gram_matrix_update_size[1];
+          for(int i=0;i<K_size[1];i++)
+          {
+            for(int j=0;j<K_size[0];j++)
+            {
+              K_data[i*K_size[0]+j] = K_update_data[i*K_size[0]+j];
+              gram_matrix_data[i*K_size[0]+j] = gram_matrix_update_data[i*K_size[0]+j];
+            }
+          }
+
+          //update X
+          X_size[0] = X_update_size[0];
+          X_size[1] = X_update_size[1];
+          for(int i=0;i<X_size[1];i++)
+            for(int j=0;j<X_size[0];j++)
+              X_data[i*X_size[0]+j] = X_update_data[i*X_size[0]+j];
+
+          //update Y
+          Y_size[0] = Y_update_size[0];
+          Y_size[1] = Y_update_size[1];
+          for(int i=0;i<Y_size[1];i++)
+            for(int j=0;j<Y_size[0];j++)
+              Y_data[i*Y_size[0]+j] = Y_update_data[i*Y_size[0]+j];
+        }
+      }
+      // std::cout<<"command v: ";
+      // for(int i=0;i<6;i++)
+      //     std::cout<< y_star[i]<<" ";
+
+      received = false;
+      getFeedbackPoint = false;
+      moved = false;
+
+      //check if reach the desired vaule
+      stopFlag = true;
+      std::cout<<"deltX: ";
+      for(int i=0;i<F3;i++)
+      {
+        if(std::abs(xd[i] - x[i]) > TOLERANCE)
+            stopFlag = false;
+        std::cout<<xd[i] - x[i]<<' ';
+      }
+      std::cout << "\n";
+
+      std::cout << "Velocity: ";
+      for(int i=0;i<6;i++)
+      {
+        y_star[i] = y_star[i]<MAX_VEL?y_star[i]:MAX_VEL;
+        y_star[i] = y_star[i]>-MAX_VEL?y_star[i]:-MAX_VEL;
+        if(stopFlag)
+            armCommand.data[i] = 0;
+        else
+            armCommand.data[i] = y_star[i];
+        std::cout<<armCommand.data[i]<<' ';
+      }
+      std::cout << "\n";
+
+      if(start)
+      {
+        //record pcd and rgb image
+        std_msgs::Int8 pcdRecorderCommand;
+        pcdRecorderCommand.data = 1;
+        pcdRecorderPublisher.publish(pcdRecorderCommand);
+
+        //send arm velocity
+        cartVelPublisher.publish(armCommand);
+        std::cout << "sended velocity command\n";
+      }
+      std::cout << "\n-----------------------\n";
+      
+    }
+    else
+    {
+      for(int i=0;i<3*M;i++)
+      {
+        // cart_v[i] = 0;
+      }
+      if (!received && !getFeedbackPoint)
+      {
+        std::cout << "Didn't receive the cart_v_real and get feedback points\n";
+      }
+      else if (!getFeedbackPoint)
+      {
+        std::cout << "Didn't get feedback points\n";
+      }
+      else
+      {
+        std::cout << "Didn't receive the cart_v_real\n";
+      }
+
+
+    }
+
+    ros::spinOnce();
+    rate.sleep();
+  }
+}
+
+
+int main(int argc, char ** argv)
+{
+  // Initialize the application.
+  // You do not need to do this more than one time.
+  onlineGPR_initialize();
+  cv::namedWindow(OPENCV_WINDOW);
+  cv::namedWindow(OPENCV_WINDOW_2);
+  cv::namedWindow(OPENCV_WINDOW_3);
+
+  // Invoke the entry-point functions.
+  // You can call entry-point functions multiple times.
+  main_soft_object_manipulator(argc,argv);
+
+  // Terminate the application.
+  // You do not need to do this more than one time.
+  // svm_destroy_param(&param);
+  onlineGPR_terminate();
+  cv::destroyWindow(OPENCV_WINDOW);
+  cv::destroyWindow(OPENCV_WINDOW_2);
+  cv::destroyWindow(OPENCV_WINDOW_3);
+  return 0;
+}
+
+//
+// File trailer for main.cpp
+//
+// [EOF]
+//

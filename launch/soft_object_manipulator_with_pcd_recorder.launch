@@ -1,0 +1,10 @@
+<launch>
+    <!-- open realsense camera -->
+    <include file="$(find realsense_ros)/launch/realsense_ros.launch">
+    <arg name="sNum1"                   value="611205001943" />
+    </include>
+
+  <node pkg="soft_object_manipulator" name="soft_object_manipulator_node" type="soft_object_manipulator_node" output="screen" />
+  <node pkg="soft_object_manipulator" name="pcd_recorder_node" type="pcd_recorder_node" output="screen" />
+</launch>
+

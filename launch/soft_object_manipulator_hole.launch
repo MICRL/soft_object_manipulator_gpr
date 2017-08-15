@@ -1,0 +1,44 @@
+<launch>
+
+    <!-- open realsense camera -->
+    <include file="$(find realsense_ros)/launch/realsense_ros.launch">
+    <arg name="sNum1"                   value="611205001943" />
+    </include>
+
+    <node pkg="soft_object_manipulator_gpr" name="soft_object_manipulator_gpr_hole_node" type="soft_object_manipulator_gpr_hole_node" output="screen">
+      <param name="RADIUS" type="double" value="0.015" />
+      <param name="K" type="int" value="10" />
+      <param name="TOP" type="int" value="10" />
+      <param name="DOWN_SAMPLE_SIZE_1" type="double" value="0.01" />
+      <param name="DOWN_SAMPLE_SIZE_2" type="double" value="0.015" />
+      <param name="FPS" type="int" value="10" />
+      <param name="MAX_VEL" type="double" value="0.04" />
+      <param name="TOLERANCE" type="double" value="0.005" />
+
+      <param name="dilate_kernel_size" type="int" value="3" />
+      <param name="dilate_iterations" type="int" value="1" />
+      <param name="erode_kernel_size" type="int" value="3" />
+      <param name="erode_iterations" type="int" value="1" />
+
+      <param name="center_threshold" type="double" value="70.0" />
+      <param name="radius_threshold" type="double" value="10.0" />
+      <param name="x_leng_threshold" type="double" value="30.0" />
+      <param name="y_leng_threshold" type="double" value="30.0" />
+      <param name="c_simi_threshold" type="double" value="0.5" />
+      <param name="c_area_threshold" type="double" value="300.0" />
+
+      <param name="reseive_threshold" type="double" value="4.0" />
+      <param name="reseive_lowerbound" type="double" value="4.0" />
+
+      <param name="distance_3d_threshold" type="double" value="0.08" />
+      <param name="z_3d_threshold" type="double" value="0.03" />
+      <param name="z_max_extand" type="double" value="0.02" />
+
+      <param name="target_1" type="double" value="0.04" />
+      <param name="target_2" type="double" value="-0.05" />
+      <param name="target_3" type="double" value="0.0" />
+      <param name="target_4" type="double" value="0.04" />
+      <param name="target_5" type="double" value="-0.05" />
+      <param name="target_6" type="double" value="0.0" />
+    </node>
+</launch>
